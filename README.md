@@ -15,4 +15,4 @@ The following datasets used during the analysis were omitted from the repository
 The following datasets used during the analysis were omitted from the repository due **confidentiality agreements**:
 
 * [Swiss Climate Change Scenarios CH2018](https://www.nccs.admin.ch/nccs/en/home/climate-change-and-impacts/swiss-climate-change-scenarios/ch2018---climate-scenarios-for-switzerland.html), available upon request.
-* Recorded tick bites within the "Zecke" app across the Swiss plateau, provided by [A&K Strategy GmbH](http://www.zeckenliga.ch/kontakt.html).
+* Tick bites reported through the ["Zecke" smartphone app](https://zecke-tique-tick.ch/de/app-zecke/) across the Swiss plateau, provided by [A&K Strategy GmbH](http://www.zeckenliga.ch/kontakt.html).
