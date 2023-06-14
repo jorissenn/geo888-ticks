@@ -1,0 +1,268 @@
+---
+title: "validation"
+author: "G1"
+date: "6/7/2023"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(sf)
+library(raster)
+library(dplyr)
+library(data.table)
+library(mapview)
+library(ggplot2)
+library(scales)
+library(patchwork)
+```
+
+
+## Validation with tick bite model
+
+```{r}
+tick_risk <- read_sf("processed_data/tick_bite_risk/tick_bite_risk.shp") %>%
+  mutate(id=row_number())
+tick_model <- raster("raw_data/tick_bite_model/ch.bag.zeckenstichmodell_2056.tif")
+
+# Clipping tick bite model to plateau
+tick_model_plateau <- mask(tick_model, tick_risk %>% summarize(geometry = st_union(geometry)))
+```
+
+```{r}
+plot(tick_model_plateau)
+```
+
+```{r}
+# Convert raster to points
+points <- rasterToPoints(tick_model_plateau)
+points <- data.frame(gkode=points[,1], gkodn=points[,2], hazard=points[,3])
+
+# Create an sf object from the points
+tick_model_points <- st_as_sf(points, coords = c("gkode", "gkodn"), crs = 2056)
+
+# Assign raster values to sf object
+tick_model_points$hazard <- points[, "hazard"]
+
+# Remove all points that are not in the Swiss plateau
+tick_model_points <- tick_model_points[tick_risk %>% summarize(geometry = st_union(geometry)),,]
+
+# assign hexagon cell to all values in which they are contained
+tick_model_points$id <- st_nearest_feature(tick_model_points, tick_risk)
+
+# compute mean value per hexagonal cell
+setDT(tick_model_points)
+tick_model_points_fishnet <- tick_model_points[, .(hazard_bag = mean(hazard)), by = id]
+
+# joining the data to the fishnet
+tick_risk <- left_join(tick_risk, tick_model_points_fishnet, by="id")
+
+# fill NA with risk 0 to ensure comparability
+tick_risk <- mutate(tick_risk, hazard_bag = ifelse(is.na(hazard_bag), 0, hazard_bag))
+```
+
+```{r}
+mapview(tick_risk, zcol="hazard_bag")
+```
+
+Tick bite model is based on early summer weather --> investigate correlation between hazard values and mean of computed spring and summer risk values.
+```{r}
+tick_risk <- tick_risk %>%
+  mutate(risk_early_summer_23 = (risk_sp_23 + risk_su_23) / 2) %>%
+  # normalizing the BAG values such that they have the same range as the values in the indicator
+  #mutate(hazard_bag_norm = scale(hazard_bag, center = mean(hazard_bag), scale = sd(hazard_bag)) * #sd(risk_early_summer_23) + mean(risk_early_summer_23))
+  mutate(hazard_bag_norm = rescale(hazard_bag, to= c(min(risk_early_summer_23), max(risk_early_summer_23)))) %>%
+  # determining the difference between the two values
+  mutate(d_bag_ind = hazard_bag_norm - risk_early_summer_23)
+```
+
+```{r warning = F}
+ggplot(data = tick_risk, mapping = aes(x=risk_early_summer_23, y = hazard_bag_norm)) +
+  geom_point(size=0.1) +
+  geom_smooth(method='lm', col="red") +
+  labs(y = "Tick bite hazard according to BAG", x = "Tick bite risk according to indicator", title="Tick bite risk vs Tick bite hazard for early summer of 2023") +
+  theme_minimal()
+
+#ggsave("figures_report/validation_plot_tick_bite_model.png")
+```
+
+```{r}
+model <- lm(hazard_bag_norm ~ risk_early_summer_23, data = tick_risk)
+
+summary(model)
+```
+
+```{r}
+# run correlation test
+cor.test(x = tick_risk$risk_early_summer_23, y = tick_risk$hazard_bag_norm)
+```
+
+--> significant correlation
+
+```{r}
+mapview(tick_risk, zcol = "d_bag_ind")
+```
+
+Difference map represents the difference between the normalized BAG hazard values and the results of the indicator. Positive values imply that the hazard is higher than the risk, while negative values imply that the risk is higher than the hazard --> notice pattern around the big cities due to incorporation of accessibility.
+
+## Validation with recorded tick bites
+
+```{r}
+#tickbites <- read.csv("raw_data/20230611-tick-reports.csv", sep=";") %>% 
+#  st_as_sf(coords=c("Lon", "Lat"), crs=4326) %>% 
+#  st_transform(2056) %>%
+#  select(geometry, date, ID)
+#fishnet <- read_sf("processed_data/fishnet/fishnet.shp")
+#tickbiterisk <- read_sf("processed_data/tick_bite_risk/tick_bite_risk.shp")
+
+#tickbites <- tickbites %>%
+#  mutate(month=month(ymd_hms(date)))
+
+#tickbites$season <- ifelse(tickbites$month %in% c(12, 1, 2), "Winter",
+#                      ifelse(tickbites$month %in% c(3, 4, 5), "Spring",
+#                             ifelse(tickbites$month %in% c(6, 7, 8), "Summer", "Autumn")))
+
+# hann de code obe is data processing tah und nachher grad als shp abgspeicheret für de report
+
+tickbites <- read_sf("processed_data/tick_bites/tick_bites_plateau.shp")
+
+tickbites_spring <- tickbites %>% filter(season=="Spring")
+tickbites_autumn <- tickbites %>% filter(season=="Autumn")
+tickbites_summer <- tickbites %>% filter(season=="Summer")
+tickbites_winter <- tickbites %>% filter(season=="Winter")
+
+joined_spring <- st_join(tickbites_spring, tick_risk, left = TRUE)
+joined_autumn <- st_join(tickbites_autumn, tick_risk, left = TRUE)
+joined_summer <- st_join(tickbites_summer, tick_risk, left = TRUE)
+joined_winter <- st_join(tickbites_winter, tick_risk, left = TRUE)
+
+# Count the number of points per hexagon cell
+#counts_spring <- joined_spring %>%
+#  group_by(id) %>%
+#  summarise(bites_sp =  n())
+
+counts_spring <- setDT(joined_spring)[, .(bites_sp = .N), by = id]
+
+#counts_autumn <- joined_autumn %>%
+#  group_by(id) %>%
+#  summarise(bites_a = n())
+
+counts_autumn <- setDT(joined_autumn)[, .(bites_a = .N), by = id]
+
+#counts_summer <- joined_summer %>%
+#  group_by(id) %>%
+#  summarise(bites_su =  n())
+
+counts_summer <- setDT(joined_summer)[, .(bites_su = .N), by = id]
+
+#counts_winter <- joined_winter %>%
+#  group_by(id) %>%
+#  summarise(bites_w = n())
+
+counts_winter <- setDT(joined_winter)[, .(bites_w = .N), by = id]
+
+tick_risk <- tick_risk %>%
+  left_join(counts_winter, by = "id") %>%
+  left_join(counts_spring, by = "id") %>%
+  left_join(counts_summer, by = "id") %>%
+  left_join(counts_autumn, by = "id")
+
+# replacing NA values by 0
+tick_risk <- tick_risk %>%
+  mutate(bites_w = ifelse(is.na(bites_w), 0, bites_w)) %>%
+  mutate(bites_sp = ifelse(is.na(bites_sp), 0, bites_sp)) %>%
+  mutate(bites_su = ifelse(is.na(bites_su), 0, bites_su)) %>%
+  mutate(bites_a = ifelse(is.na(bites_a), 0, bites_a))
+
+#tickbiterisk$nr_bites_spring <- counts_spring$nr_bites_spring
+#tickbiterisk$nr_bites_autumn <- counts_autumn$nr_bites_autumn
+#tickbiterisk$nr_bites_summer <- counts_summer$nr_bites_summer
+#tickbiterisk$nr_bites_winter <- counts_winter$nr_bites_winter
+
+# glaub normalisiere isch nöd nötig
+
+#tickbiterisk$nr_bites_spring_norm <- tickbiterisk$nr_bites_spring / max(tickbiterisk$nr_bites_spring)
+#tickbiterisk$nr_bites_autumn_norm <- tickbiterisk$nr_bites_autumn / max(tickbiterisk$nr_bites_autumn)
+#tickbiterisk$nr_bites_summer_norm <- tickbiterisk$nr_bites_summer / max(tickbiterisk$nr_bites_summer)
+#tickbiterisk$nr_bites_winter_norm <- tickbiterisk$nr_bites_winter / max(tickbiterisk$nr_bites_winter)
+```
+
+```{r}
+sum(tick_risk$bites_w, tick_risk$bites_sp, tick_risk$bites_su, tick_risk$bites_a, na.rm=T)
+```
+```{r}
+mapview(tick_risk, zcol="bites_sp")
+```
+
+```{r}
+plot_bites_winter <- ggplot(data = tick_risk, mapping = aes(x=risk_w_23, y = bites_w)) +
+  geom_point(size=0.1) +
+  geom_smooth(method='lm', col="red") +
+  labs(y = "Number of recorded tick bites", x = "Tick bite risk according to indicator", title="Tick bite risk vs recorded tick bites for winter 2023") +
+  theme_minimal()
+
+plot_bites_winter
+```
+
+```{r}
+summary(lm(bites_w ~ risk_w_23, data = tick_risk))
+cor.test(tick_risk$risk_w_23, tick_risk$bites_w)
+```
+
+```{r}
+plot_bites_spring <- ggplot(data = tick_risk, mapping = aes(x=risk_sp_23, y = bites_sp)) +
+  geom_point(size=0.1) +
+  geom_smooth(method='lm', col="red") +
+  labs(y = "Number of recorded tick bites", x = "Tick bite risk according to indicator", title="Spring 2023") +
+  theme_minimal()
+
+plot_bites_spring
+```
+
+```{r}
+summary(lm(bites_sp ~ risk_sp_23, data = tick_risk))
+cor.test(tick_risk$risk_sp_23, tick_risk$bites_sp)
+```
+```{r}
+plot_bites_summer <- ggplot(data = tick_risk, mapping = aes(x=risk_su_23, y = bites_su)) +
+  geom_point(size=0.1) +
+  geom_smooth(method='lm', col="red") +
+  labs(y = "Number of recorded tick bites", x = "Tick bite risk according to indicator", title="Summer 2023") +
+  theme_minimal()
+
+plot_bites_summer
+```
+
+```{r}
+summary(lm(bites_su ~ risk_su_23, data = tick_risk))
+cor.test(tick_risk$risk_su_23, tick_risk$bites_su)
+```
+
+```{r}
+plot_bites_autumn <- ggplot(data = tick_risk, mapping = aes(x=risk_a_23, y = bites_a)) +
+  geom_point(size=0.1) +
+  geom_smooth(method='lm', col="red") +
+  labs(y = "Number of recorded tick bites", x = "Tick bite risk according to indicator", title="Tick bite risk vs recorded tick bites for autumn 2023") +
+  theme_minimal()
+
+plot_bites_autumn
+```
+
+```{r}
+summary(lm(bites_a ~ risk_a_23, data = tick_risk))
+cor.test(tick_risk$risk_a_23, tick_risk$bites_a)
+```
+```{r}
+plot_bites_spring + plot_bites_summer
+
+ggsave("figures_report/validation_plot_tick_bites.png")
+```
+
+
+```{r}
+#st_write(tick_risk %>% select(id, d_bag_ind, bites_w, bites_sp, bites_su, bites_a), "processed_data/validation/validation.shp", append=F)
+```
+

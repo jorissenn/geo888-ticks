@@ -1,0 +1,244 @@
+---
+title: "data_vis"
+author: "G1"
+date: "6/3/2023"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(ggplot2)
+library(sf)
+library(patchwork)
+library(dplyr)
+library(RColorBrewer)
+library(raster)
+library(leaflet)
+```
+
+# Swiss plateau as basis
+
+```{r}
+# Swiss plateau as basis
+bio_geo_regions <- read_sf("raw_data/biogeographical_regions/N2020_Revision_BiogeoRegion.shp")
+
+plateau <- bio_geo_regions %>%
+  group_by(DERegionNa) %>%
+  summarize(geometry=st_union(geometry)) %>%
+  rename(name = DERegionNa) %>%
+  filter(name == "Mittelland")
+```
+
+# Land cover
+
+```{r}
+# Loading Arealstatistik
+arealstatistik <- read.csv("raw_data/land_cover/ag-b-00.03-37-area-csv.csv", sep=";") %>%
+  select(E, N, AS18_17) %>%
+  rename(id_landcover = AS18_17) %>%
+  st_as_sf(coords = c("E", "N"), crs=2056, agr = "constant")
+
+arealstatistik_plateau <- arealstatistik[plateau,,]
+
+rm(arealstatistik)
+```
+
+```{r}
+# Defining the weights for the 17 classes AS_17 defined in a separate csv
+land_cover_classes <- read.csv("raw_data/land_cover/land_cover_weights.csv")
+
+# Computing sum of weights per hexagon cell
+arealstatistik_plateau <- left_join(arealstatistik_plateau, land_cover_classes %>% select(id_landcover, name_en), by="id_landcover")
+```
+
+```{r}
+#arealstatistik_plateau$name_en_fac <- as.factor(arealstatistik_plateau$name_en)
+
+# Reorder
+arealstatistik_plateau$name_en_fac <- factor(arealstatistik_plateau$name_en, 
+                                             levels=c("Industrial and commercial area",
+                                                      "Building area",
+                                                      "Traffic area",
+                                                      "Special settlement areas",
+                                                      "Recreation and green areas",
+                                                      "Orchards, vineyards and horticultural areas",
+                                                      "Arable land",
+                                                      "Natural meadows, home pastures",
+                                                      "Alpine farmland",
+                                                      "Forest (without scrub forest)",
+                                                      "Grove",
+                                                      "Standing waters",
+                                                      "Running waters",
+                                                      "Non-productive vegetation",
+                                                      "Areas without vegetation"))
+
+
+cols <- c("#a71760", "#ea5851", "#4d230f", "#808190", "#573888", "#ce902d", "#efcf9f", "#e4e010", "#807738", "#1a9c39", "#a5c711", "#149fdb", "#305fa9", "#b7d6b7", "#d8e8e7")
+names(cols) <- levels(arealstatistik_plateau$name_en_fac)
+```
+
+
+```{r}
+land_cover <- ggplot() +
+  geom_sf(data=plateau, fill=NA) +
+  geom_sf(data=arealstatistik_plateau, mapping=aes(col=name_en_fac), size=0.1) +
+  labs(col="Land cover class") +
+  scale_colour_manual(name = "Land cover class",values = cols) +
+  guides(col = guide_legend(override.aes = list(size=1.5))) +
+  theme_void()
+
+land_cover
+```
+# STATPOP
+
+```{r}
+bfs_pop <- read.csv("raw_data/statpop/STATPOP2021.csv", sep=";") %>%
+  select(E_KOORD, N_KOORD, B21BTOT) %>%
+  rename(pop = B21BTOT) %>%
+  st_as_sf(coords = c("E_KOORD", "N_KOORD"), crs=2056, agr="constant")
+
+bfs_pop_plateau <- bfs_pop[plateau,,]
+```
+
+```{r}
+# classifying population
+bfs_pop_plateau <- bfs_pop_plateau %>%
+  mutate(pop_cat = ifelse(pop > 100, "> 100",
+                          ifelse(pop > 50, "50 - 100",
+                                 ifelse(pop > 25, "25 - 50",
+                                   ifelse(pop > 20, "20 - 25",
+                                          ifelse(pop > 15, "15 - 20" ,"< 15"))))))
+
+bfs_pop_plateau$pop_cat <- factor(bfs_pop_plateau$pop_cat, levels=c("> 100", "50 - 100", "25 - 50", "20 - 25", "15 - 20", "< 15"))
+```
+
+
+```{r}
+statpop <- ggplot() +
+  geom_sf(data=plateau, fill="gray85") +
+  geom_sf(data=bfs_pop_plateau %>% filter(pop > 20), mapping=aes(col=pop_cat), size=0.1) +
+  labs(col="Population (100 x 100 m grid)") +
+  scale_colour_brewer(palette="Blues", direction=1) +
+  guides(col = guide_legend(override.aes = list(size=1.5))) +
+  theme_void()
+
+statpop
+```
+# Climate data
+
+```{r}
+# reading the necessary raster data
+temperature_ch_july_rast <- raster("raw_data/climate/wald-lufttemperatur_juli_1981_2010_2056.tif")
+humidity_ch_july_rast <- raster("raw_data/climate/wald-relative_luftfeuchte_juli_1981_2010_2056.tif")
+
+# downsample 25 m x 25 m --> 1 km x 1km
+#temperature_ch_july_rast <- aggregate(temperature_ch_july_rast, fact=c(1000/25, 1000/25))
+#humidity_ch_july_rast <- aggregate(humidity_ch_july_rast, fact=c(1000/25, 1000/25))
+```
+```{r}
+temperature_ch_july_rast_plateau <- mask(temperature_ch_july_rast, st_zm(plateau))
+humidity_ch_july_rast_plateau <- mask(humidity_ch_july_rast, st_zm(plateau))
+```
+
+```{r}
+temperature_ch_july_rast_plateau_df <- as.data.frame(temperature_ch_july_rast_plateau, xy = TRUE)
+humidity_ch_july_rast_plateau_df <- as.data.frame(humidity_ch_july_rast_plateau, xy=TRUE)
+```
+
+```{r}
+temperature <- ggplot() +
+  geom_tile(data = temperature_ch_july_rast_plateau_df %>% filter(wald.lufttemperatur_juli_1981_2010_2056 > 0), mapping=aes(x, y, fill=wald.lufttemperatur_juli_1981_2010_2056)) +
+  scale_fill_gradient(low="#fff0f5", high="#f03c2b") +
+  labs(fill = "Mean daily high of air temp. [°C]") +
+  coord_equal() +
+  theme_void()
+
+humidity <- ggplot() +
+  geom_tile(data = humidity_ch_july_rast_plateau_df %>% filter(wald.relative_luftfeuchte_juli_1981_2010_2056 > 0), mapping=aes(x, y, fill=wald.relative_luftfeuchte_juli_1981_2010_2056)) +
+  scale_fill_gradient(low="#feca61", high="#399156") +
+  labs(fill = "Mean relative air humidity [%]") +
+  coord_equal() +
+  theme_void()
+
+temperature
+humidity
+```
+
+```{r}
+# reading the necessary raster data
+temp_85 <- raster("raw_data/climate/future/processed_data/CH2018_tasmax_CLMCOM-CCLM4_ECEARTH_EUR11_RCP85_QMgrid_2070-2099_summer.tif")
+
+temp_85_plateau <- mask(temp_85, st_zm(plateau %>% summarize(geometry = st_union(geometry))))
+
+temp_85_plateau_df <- as.data.frame(temp_85_plateau, xy = TRUE)
+```
+
+```{r}
+temperature_2085 <- ggplot() +
+  geom_tile(data = temp_85_plateau_df %>% filter(CH2018_tasmax_CLMCOM.CCLM4_ECEARTH_EUR11_RCP85_QMgrid_2070.2099_summer > 0), mapping=aes(x, y, fill=CH2018_tasmax_CLMCOM.CCLM4_ECEARTH_EUR11_RCP85_QMgrid_2070.2099_summer)) +
+  scale_fill_gradient(low="#fff0f5", high="#f03c2b") +
+  labs(fill = "Mean daily high of air temp. [°C]") +
+  coord_equal() +
+  theme_void()
+
+temperature_2085
+```
+
+```{r}
+tick_bites <- read_sf("processed_data/tick_bites/tick_bites_plateau.shp")
+
+tick_bites$season <- factor(tick_bites$season,
+                             levels = c("Winter",
+                                        "Spring",
+                                        "Summer",
+                                        "Autumn"))
+
+ggplot() +
+  geom_bar(data = tick_bites %>% filter(year %in% c(2018, 2019, 2020, 2021, 2022)), mapping=aes(x = year, fill = season), alpha=0.7, width = 0.5) +
+  scale_fill_manual(values = c("Spring" = "springgreen3", 
+                                "Summer" = "red", 
+                                "Autumn" = "orange",
+                                "Winter" = "lightblue")) +
+  labs(x = "", y = "Number of reported tick bites", title = "Number of reported tick bites by year and season", fill="") +
+  scale_y_continuous(labels = scales::comma)+
+  theme_minimal()
+
+#ggsave("figures_report/tick_bites_by_year.png")
+```
+
+```{r}
+tbe <- read.csv("raw_data/cases_tick_diseases/tbe.csv")
+lyme <- read.csv("raw_data/cases_tick_diseases/lyme_disease.csv")
+```
+
+```{r}
+library(patchwork)
+
+tbe_cases <- ggplot() +
+  geom_bar(data=tbe, mapping=aes(x = ï..year, y=cases), stat="identity") +
+  labs(x = "", y = "Number of cases", title="Number of TBE cases") +
+  theme_minimal()
+
+lyme_cases <- ggplot() + 
+  geom_bar(data=lyme, mapping=aes(x = ï..year, y=cases), stat="identity") +
+  labs(x = "", y = "Estimated number of cases", title="Number of Lyme disease cases") +
+  theme_minimal()
+
+lyme_cases + tbe_cases
+
+ggsave("figures_report/tick_disease_cases.png")
+```
+
+
+```{r}
+# Saving the figures
+#ggsave("figures_report/statpop.png", plot=statpop)
+#ggsave("figures_report/land_cover.png", plot=land_cover)
+#ggsave("figures_report/temperature.png", plot=temperature)
+#ggsave("figures_report/humidity.png", plot=humidity)
+#ggsave("figures_report/temperature_2085.png", plot=temperature_2085)
+```
+

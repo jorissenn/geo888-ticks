@@ -1,0 +1,140 @@
+---
+title: "Untitled"
+author: "G1"
+date: "6/6/2023"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+This script takes the raw data from the CH2018 climate scenarios and outputs a raster in TIF format with the average projected highest daily temperature in the period between 2070 and 2099 for the four seasons.
+
+```{r}
+library(ncdf4) 
+library(raster) 
+library(mapview)
+```
+
+```{r}
+# name for rcp 4.5
+name <- "CH2018_tasmax_CLMCOM-CCLM4_ECEARTH_EUR11_RCP45_QMgrid_"
+# name for rcp 8.5
+#name <- "CH2018_tasmax_CLMCOM-CCLM4_ECEARTH_EUR11_RCP85_QMgrid_" 
+
+# Load netcdf file
+netcdf <- nc_open(paste0("raw_data/climate/future/raw_data/", name, "1981-2099.nc"))
+```
+
+```{r}
+# Dates are given in "number of days since 01-01-1900" 
+# --> we need to know which observations belong to winter, spring, summer and autumn in the period between 01-01-2070 - 31-12-2099
+start_date <- as.Date("2070-01-01")
+end_date <- as.Date("2099-12-31")
+origin_date <- as.Date("1900-01-01")
+origin_measurements <- as.Date(29585, origin="1900-01-01")
+
+# Total measurement period
+measurement_period <- seq(origin_measurements, end_date, by="day")
+
+# Calculate the days in the period of interest
+start_day <- as.integer(start_date - origin_date)
+end_day <- as.integer(as.Date("2099-12-31") - origin_date)
+
+dates_of_interest_num <- seq(start_day, end_day)
+dates_of_interest <- as.Date(dates_of_interest_num, origin = "1900-01-01")
+
+# Figuring out, which of these days belong to which season
+winter_dates <- dates_of_interest[months(dates_of_interest) %in% c("December", "January", "February")]
+spring_dates <- dates_of_interest[months(dates_of_interest) %in% c("March", "April", "May")]
+summer_dates <- dates_of_interest[months(dates_of_interest) %in% c("June", "July", "August")]
+autumn_dates <- dates_of_interest[months(dates_of_interest) %in% c("September", "October", "November")]
+
+# What are the indices of these dates in the original measurement period?
+winter_indices <- measurement_period %in% winter_dates
+spring_indices <- measurement_period %in% spring_dates
+summer_indices <- measurement_period %in% summer_dates
+autumn_indices <- measurement_period %in% autumn_dates
+```
+
+After figuring out the time indices of the measurement values we need, we can filter the original NetCDF object and calculate the mean in the period to obtain one single output raster for every season.
+
+```{r}
+# extracting all temperature values, lat and lon values
+temp_vals <- ncvar_get(netcdf, "tasmax")
+lon_vals <- ncvar_get(netcdf, "lon")
+lat_vals <- ncvar_get(netcdf, "lat")
+```
+
+```{r}
+# extracting temperature values for every season
+temp_winter <- temp_vals[,,winter_indices]
+temp_spring <- temp_vals[,,spring_indices]
+temp_summer <- temp_vals[,,summer_indices]
+temp_autumn <- temp_vals[,,autumn_indices]
+
+# Calculating mean per coordinate
+mean_temp_winter <- as.matrix(rowMeans(temp_winter, dims=2))
+mean_temp_spring <- as.matrix(rowMeans(temp_spring, dims=2))
+mean_temp_summer <- as.matrix(rowMeans(temp_summer, dims=2))
+mean_temp_autumn <- as.matrix(rowMeans(temp_autumn, dims=2))
+```
+
+```{r}
+# CH1903 / LV95+
+target_proj <- crs("+init=epsg:2056")
+
+# creating a raster object and geocoding
+mean_temp_winter_raster <- raster(t(mean_temp_winter[,ncol(mean_temp_winter):1]), xmn = min(lon_vals), xmx= max(lon_vals), ymn = min(lat_vals), ymx = max(lat_vals))
+crs(mean_temp_winter_raster) <- "+proj=longlat +datum=WGS84"
+mean_temp_winter_raster <- projectRaster(mean_temp_winter_raster, crs=target_proj)
+
+mean_temp_spring_raster <- raster(t(mean_temp_spring[,ncol(mean_temp_spring):1]), xmn = min(lon_vals), xmx= max(lon_vals), ymn = min(lat_vals), ymx = max(lat_vals))
+crs(mean_temp_spring_raster) <- "+proj=longlat +datum=WGS84"
+mean_temp_spring_raster <- projectRaster(mean_temp_spring_raster, crs=target_proj)
+
+mean_temp_summer_raster <- raster(t(mean_temp_summer[,ncol(mean_temp_summer):1]), xmn = min(lon_vals), xmx= max(lon_vals), ymn = min(lat_vals), ymx = max(lat_vals))
+crs(mean_temp_summer_raster) <- "+proj=longlat +datum=WGS84"
+mean_temp_summer_raster <- projectRaster(mean_temp_summer_raster, crs=target_proj)
+
+mean_temp_autumn_raster <- raster(t(mean_temp_autumn[,ncol(mean_temp_autumn):1]), xmn = min(lon_vals), xmx= max(lon_vals), ymn = min(lat_vals), ymx = max(lat_vals))
+crs(mean_temp_autumn_raster) <- "+proj=longlat +datum=WGS84"
+mean_temp_autumn_raster <- projectRaster(mean_temp_autumn_raster, crs=target_proj)
+```
+
+```{r}
+temperature_ch_july_rast <- raster("raw_data/climate/present/wald-lufttemperatur_juli_1981_2010_2056.tif")
+temperature_ch_july_rast <- aggregate(temperature_ch_july_rast, fact=c(1000/25, 1000/25))
+
+# resampling all the datasets to be the same resolution as the present climate data
+mean_temp_winter_raster <- resample(mean_temp_winter_raster, temperature_ch_july_rast)
+mean_temp_spring_raster <- resample(mean_temp_spring_raster, temperature_ch_july_rast)
+mean_temp_summer_raster <- resample(mean_temp_summer_raster, temperature_ch_july_rast)
+mean_temp_autumn_raster <- resample(mean_temp_autumn_raster, temperature_ch_july_rast)
+```
+
+
+```{r}
+mapview(mean_temp_winter_raster)
+```
+
+```{r}
+plot(mean_temp_summer_raster)
+```
+
+
+```{r}
+# saving as TIFF file
+writeRaster(mean_temp_winter_raster, filename= paste0("raw_data/climate/future/processed_data/", name, "2070-2099_winter.tif"), format="GTiff", overwrite=T)
+writeRaster(mean_temp_spring_raster, filename= paste0("raw_data/climate/future/processed_data/", name, "2070-2099_spring.tif"), format="GTiff", overwrite=T)
+writeRaster(mean_temp_summer_raster, filename= paste0("raw_data/climate/future/processed_data/", name, "2070-2099_summer.tif"), format="GTiff", overwrite=T)
+writeRaster(mean_temp_autumn_raster, filename= paste0("raw_data/climate/future/processed_data/", name, "2070-2099_autumn.tif"), format="GTiff", overwrite=T)
+```
+
+```{r}
+test <- raster("raw_data/climate/future/processed_data/CH2018_tasmax_CLMCOM-CCLM4_ECEARTH_EUR11_RCP45_QMgrid_2070-2099_autumn.tif")
+
+plot(test)
+```
+

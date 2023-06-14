@@ -1,0 +1,621 @@
+---
+title: "data_processing"
+author: "G1"
+date: "5/18/2023"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(raster)
+library(tidyverse)
+library(sf)
+library(leaflet)
+library(data.table)
+library(patchwork)
+library(lubridate)
+library(mapview)
+library(rmapshaper)
+
+options(dplyr.summarise.inform = FALSE)
+```
+
+### Creating the raster
+```{r}
+# Swiss plateau as basis
+bio_geo_regions <- read_sf("raw_data/biogeographical_regions/N2020_Revision_BiogeoRegion.shp")
+
+plateau <- bio_geo_regions %>%
+  group_by(DERegionNa) %>%
+  summarize(geometry=st_union(geometry)) %>%
+  rename(name = DERegionNa) %>%
+  filter(name == "Mittelland")
+
+# Simplifying plateau geometry and saving as shp
+#plateau_simp <- ms_simplify(plateau, keep_shapes=T, keep=0.005)
+#st_write(plateau_simp, "processed_data/plateau/plateau.shp")
+```
+
+```{r warning=F}
+# resolution of the hexagonal raster in m
+resolution <- 2000
+
+# Creating hexagonal fishnet based on geometry of plateau
+target_fishnet <- st_sf(st_make_grid(plateau, cellsize=resolution, square=F)) %>%
+  rename(geometry = st_make_grid.plateau..cellsize...resolution..square...F.)
+target_fishnet <- target_fishnet[plateau,,]
+
+# Adding row number for later join
+target_fishnet <- mutate(target_fishnet, id = row_number())
+
+# Generating points at centroid coordinates
+target_fishnet_points <- target_fishnet %>%
+  mutate(GKODE=st_coordinates(st_centroid(.))[,1]) %>%
+  mutate(GKODN=st_coordinates(st_centroid(.))[,2]) %>%
+  st_drop_geometry() %>%
+  st_as_sf(., coords=c("GKODE", "GKODN"), crs=2056, agr="constant")
+
+ggplot() +
+  geom_sf(data=plateau) +
+  geom_sf(data = target_fishnet, alpha=0.5) +
+  theme_void()
+```
+
+```{r}
+# creating a union of the fishnet for faster filtering purposes
+target_fishnet_union <- target_fishnet %>%
+  summarize(geometry = st_union(geometry))
+
+#ggplot() +
+#  geom_sf(data=plateau) +
+#  geom_sf(data = target_fishnet_union, alpha=0.5) +
+#  theme_void()
+```
+
+### Climate data
+
+#### Present situation
+```{r warning=F}
+# reading the necessary raster data
+temperature_ch_july_rast <- raster("raw_data/climate/present/wald-lufttemperatur_juli_1981_2010_2056.tif")
+humidity_ch_july_rast <- raster("raw_data/climate/present/wald-relative_luftfeuchte_juli_1981_2010_2056.tif")
+
+# downsample 25 m x 25 m --> 1 km x 1km
+temperature_ch_july_rast <- aggregate(temperature_ch_july_rast, fact=c(1000/25, 1000/25))
+humidity_ch_july_rast <- aggregate(humidity_ch_july_rast, fact=c(1000/25, 1000/25))
+
+par(mfrow=c(1,2))
+plot(temperature_ch_july_rast)
+plot(humidity_ch_july_rast)
+```
+
+```{r}
+## Temperature data
+
+# Convert raster to points
+points <- rasterToPoints(temperature_ch_july_rast)
+points <- data.frame(gkode=points[,1], gkodn=points[,2], temp=points[,3])
+
+# Create an sf object from the points
+temperature_ch_july <- st_as_sf(points, coords = c("gkode", "gkodn"), crs = 2056)
+
+# Assign raster values to sf object
+temperature_ch_july$temp <- points[, "temp"]
+
+# Remove all temperature points that are not in the Swiss plateau
+temperature_ch_july <- temperature_ch_july[target_fishnet_union,,]
+
+# assign hexagon cell to all temperature values in which they are contained
+temperature_ch_july$id <- st_nearest_feature(temperature_ch_july, target_fishnet)
+
+# compute mean temperature per hexagonal cell
+setDT(temperature_ch_july)
+temperature_ch_july_fishnet <- temperature_ch_july[, .(temp_july = mean(temp)), by = id]
+
+# joining the data to the fishnet
+target_fishnet <- left_join(target_fishnet, temperature_ch_july_fishnet, by="id")
+```
+
+```{r}
+## Humidity data
+
+# Convert raster to points
+points <- rasterToPoints(humidity_ch_july_rast)
+points <- data.frame(gkode=points[,1], gkodn=points[,2], hum=points[,3])
+
+# Create an sf object from the points
+humidity_ch_july <- st_as_sf(points, coords = c("gkode", "gkodn"), crs = 2056)
+
+# Assign raster values to sf object
+humidity_ch_july$hum <- points[, "hum"]
+
+# Remove all humidity points that are not in the Swiss plateau
+humidity_ch_july <- humidity_ch_july[target_fishnet_union,,]
+
+# assign hexagon cell to all humidity values in which they are contained
+humidity_ch_july$id <- st_nearest_feature(humidity_ch_july, target_fishnet)
+
+# compute mean humidity per hexagonal cell
+setDT(humidity_ch_july)
+humidity_ch_july_fishnet <- humidity_ch_july[, .(hum_july = mean(hum)), by = id]
+
+# joining the data to the fishnet
+target_fishnet <- left_join(target_fishnet, humidity_ch_july_fishnet, by="id")
+```
+
+```{r}
+temp <- ggplot() +
+  geom_sf(data = plateau) +
+  geom_sf(data = target_fishnet, aes(fill = temp_july), color=NA, alpha = 0.8) +
+  scale_fill_gradient(low = "#FFCCCB", high = "#8b0000") +
+  theme_void()
+
+hum <- ggplot() +
+  geom_sf(data=plateau) +
+  geom_sf(data=target_fishnet, aes(fill = hum_july), color=NA, alpha=0.8)+
+  scale_fill_gradient(low = "#FFCCCB", high="#90ee90") +
+  theme_void()
+
+temp + hum
+```
+
+We have the temperature and humidity levels for July, now we need to them for the remaining months, for which we use the data from the measurement stations located in the Swiss plateau over the same period.
+
+```{r}
+# Swiss meteo stations in plateau: Basel - Binningen, Bern - Zollikofen, Geneve / Cointrin, Luzern, Neuchatel, Payerne, Zurich / Fluntern, St. Gallen
+stations_plateau <- c("BAS", "BER", "GVE", "LUZ", "NEU", "PAY", "SMA", "STG")
+
+# locations of all Swiss meteo stations
+stations <- read.csv("raw_data/climate/present/meteo_stations/meteoswissstations.csv")
+
+stations <- stations %>%
+  dplyr::filter(station.location %in% stations_plateau) %>%
+  dplyr::select(`ï..Station`, station.location, CoordinatesE, CoordinatesN) %>%
+  st_as_sf(., coords=c("CoordinatesE", "CoordinatesN"), crs=2056, agr="constant")
+
+stations_mean_measurements <- data.frame()
+
+# calculating average humidity and temperature for all stations for every months between 1981 and 2010
+for (i in 1:length(stations_plateau)) {
+  station_data <- read.csv(paste0("raw_data/climate/present/meteo_stations/nbcn-daily_",stations_plateau[i],"_previous.csv"), sep=";")
+  
+  # formatting date
+  station_data$date <- ymd(station_data$date)
+  station_data$year <- year(station_data$date)
+  station_data$month <- month(station_data$date, label=T)
+  
+  # average daily max temperature and humidity per month between 1981 and 2010
+  station_data_month_mean <- station_data %>%
+    filter(year >= 1981 & year <= 2010) %>%
+    group_by(month) %>%
+    summarize(temp = mean(as.numeric(tre200dx)), hum=mean(as.numeric(ure200d0)))
+  
+  # pivoting the dataframe
+  station_data_month_mean_pivot <- pivot_wider(
+    data = station_data_month_mean,
+    names_from = month,
+    values_from = c(temp, hum)
+  )
+  
+  # inserting station name into pivoted dataframe
+  station_data_month_mean_pivot$station.location <- stations_plateau[i]
+  
+  stations_mean_measurements <- rbind(station_data_month_mean_pivot, stations_mean_measurements)
+}
+
+# joining the results to the stations sf object
+stations <- left_join(stations, stations_mean_measurements, by="station.location")
+```
+
+Temperature and humidity values for months apart from July are calculated based on the delta between the respective of month and the July values for the closest station.
+
+```{r}
+# assigning closest station for every fishnet cell
+target_fishnet$nearest_station <- stations_plateau[st_nearest_feature(target_fishnet, stations)]
+
+# calculation of the missing month values
+target_fishnet_measurements <- left_join(target_fishnet, stations %>% st_drop_geometry(), by=c("nearest_station" = "station.location")) %>%
+  st_drop_geometry()
+
+ggplot() +
+  geom_sf(data = plateau) +
+  geom_sf(data = target_fishnet, aes(fill = nearest_station), color=NA, alpha = 0.8) +
+  theme_void()
+```
+
+```{r}
+target_fishnet_measurements <- target_fishnet_measurements %>%
+  mutate(temp_january = temp_july - (temp_Jul - temp_Jan)) %>%
+  mutate(temp_february = temp_july - (temp_Jul - temp_Feb)) %>%
+  mutate(temp_march = temp_july - (temp_Jul - temp_Mar)) %>%
+  mutate(temp_april = temp_july - (temp_Jul - temp_Apr)) %>%
+  mutate(temp_may = temp_july - (temp_Jul - temp_May)) %>%
+  mutate(temp_june = temp_july - (temp_Jul - temp_Jun)) %>%
+  mutate(temp_august = temp_july - (temp_Jul - temp_Aug)) %>%
+  mutate(temp_september = temp_july - (temp_Jul - temp_Sep)) %>%
+  mutate(temp_october = temp_july - (temp_Jul - temp_Oct)) %>%
+  mutate(temp_november = temp_july - (temp_Jul - temp_Nov)) %>%
+  mutate(temp_december = temp_july - (temp_Jul - temp_Dec)) %>%
+  mutate(hum_january = hum_july - (hum_Jul - hum_Jan)) %>%
+  mutate(hum_february = hum_july - (hum_Jul - hum_Feb)) %>%
+  mutate(hum_march = hum_july - (hum_Jul - hum_Mar)) %>%
+  mutate(hum_april = hum_july - (hum_Jul - hum_Apr)) %>%
+  mutate(hum_may = hum_july - (hum_Jul - hum_May)) %>%
+  mutate(hum_june = hum_july - (hum_Jul - hum_Jun)) %>%
+  mutate(hum_august = hum_july - (hum_Jul - hum_Aug)) %>%
+  mutate(hum_september = hum_july - (hum_Jul - hum_Sep)) %>%
+  mutate(hum_october = hum_july - (hum_Jul - hum_Oct)) %>%
+  mutate(hum_november = hum_july - (hum_Jul - hum_Nov)) %>%
+  mutate(hum_december = hum_july - (hum_Jul - hum_Dec)) %>%
+  
+  # aggregating to seasons through means of the respective months
+  mutate(temp_winter_present = rowMeans(dplyr::select(., temp_december, temp_january, temp_february))) %>%
+  mutate(temp_spring_present = rowMeans(dplyr::select(., temp_march, temp_april, temp_may))) %>%
+  mutate(temp_summer_present = rowMeans(dplyr::select(., temp_june, temp_july, temp_august))) %>%
+  mutate(temp_autumn_present = rowMeans(dplyr::select(., temp_september, temp_october, temp_november))) %>%
+  mutate(hum_winter_present = rowMeans(dplyr::select(., hum_december, hum_january, hum_february))) %>%
+  mutate(hum_spring_present = rowMeans(dplyr::select(., hum_march, hum_april, hum_may))) %>%
+  mutate(hum_summer_present = rowMeans(dplyr::select(., hum_june, hum_july, hum_august))) %>%
+  mutate(hum_autumn_present = rowMeans(dplyr::select(., hum_september, hum_october, hum_november))) %>%
+  
+  # calculation of saturation deficit for every season according to Randolph & Storey (1999)
+  mutate(sd_spring_present = (1 - (hum_spring_present/100)) * 4.9463 * exp(0.0621 * temp_spring_present)) %>%
+  mutate(sd_summer_present = (1 - (hum_summer_present/100)) * 4.9463 * exp(0.0621 * temp_summer_present)) %>%
+  mutate(sd_autumn_present = (1 - (hum_autumn_present/100)) * 4.9463 * exp(0.0621 * temp_autumn_present)) %>%
+  mutate(sd_winter_present = (1 - (hum_winter_present/100)) * 4.9463 * exp(0.0621 * temp_winter_present))
+```
+
+```{r}
+# rejoining to the geometry
+target_fishnet <- target_fishnet %>%
+  select(id, geometry) %>%
+  left_join(target_fishnet_measurements %>% 
+              dplyr::select(id, 
+                            hum_winter_present, hum_spring_present, hum_summer_present, hum_autumn_present,
+                            temp_winter_present, temp_spring_present, temp_summer_present, temp_autumn_present,
+                            sd_winter_present, sd_spring_present, sd_summer_present, sd_autumn_present),
+            by="id")
+```
+
+#### Future situation
+
+```{r warning=F}
+# Reading data processed in the script "climate_model_data_processing.rmd" for RCP 4.5 and 8.5 (all seasons)
+temp_winter_45 <- raster("raw_data/climate/future/processed_data/CH2018_tasmax_CLMCOM-CCLM4_ECEARTH_EUR11_RCP45_QMgrid_2070-2099_winter.tif")
+temp_spring_45 <- raster("raw_data/climate/future/processed_data/CH2018_tasmax_CLMCOM-CCLM4_ECEARTH_EUR11_RCP45_QMgrid_2070-2099_spring.tif")
+temp_summer_45 <- raster("raw_data/climate/future/processed_data/CH2018_tasmax_CLMCOM-CCLM4_ECEARTH_EUR11_RCP45_QMgrid_2070-2099_summer.tif")
+temp_autumn_45 <- raster("raw_data/climate/future/processed_data/CH2018_tasmax_CLMCOM-CCLM4_ECEARTH_EUR11_RCP45_QMgrid_2070-2099_autumn.tif")
+temp_winter_85 <- raster("raw_data/climate/future/processed_data/CH2018_tasmax_CLMCOM-CCLM4_ECEARTH_EUR11_RCP85_QMgrid_2070-2099_winter.tif")
+temp_spring_85 <- raster("raw_data/climate/future/processed_data/CH2018_tasmax_CLMCOM-CCLM4_ECEARTH_EUR11_RCP85_QMgrid_2070-2099_spring.tif")
+temp_summer_85 <- raster("raw_data/climate/future/processed_data/CH2018_tasmax_CLMCOM-CCLM4_ECEARTH_EUR11_RCP85_QMgrid_2070-2099_summer.tif")
+temp_autumn_85 <- raster("raw_data/climate/future/processed_data/CH2018_tasmax_CLMCOM-CCLM4_ECEARTH_EUR11_RCP85_QMgrid_2070-2099_autumn.tif")
+
+# Function that computes the average temperature in each grid cell
+computeAvgTemp <- function(scenario){
+  # Convert raster to points
+  points <- rasterToPoints(scenario)
+  points <- data.frame(gkode=points[,1], gkodn=points[,2], temp=points[,3])
+  
+  # Create an sf object from the points
+  temperature_ch <- st_as_sf(points, coords = c("gkode", "gkodn"), crs = 2056)
+  
+  # Assign raster values to sf object
+  temperature_ch$temp <- points[, "temp"]
+  
+  # Remove all temperature points that are not in the Swiss plateau
+  temperature_ch <- temperature_ch[target_fishnet_union,,]
+  
+  # assign hexagon cell to all temperature values in which they are contained
+  temperature_ch$id <- st_nearest_feature(temperature_ch, target_fishnet)
+  
+  # compute mean temperature per hexagonal cell
+  setDT(temperature_ch)
+  temperature_ch_fishnet <- temperature_ch[, .(temp = mean(temp)), by = id]
+  
+  return(temperature_ch_fishnet)
+}
+
+target_fishnet <- left_join(target_fishnet, 
+                            computeAvgTemp(temp_winter_45) %>% rename(temp_winter_45 = temp), 
+                            by="id")
+target_fishnet <- left_join(target_fishnet, 
+                            computeAvgTemp(temp_spring_45) %>% rename(temp_spring_45 = temp), 
+                            by="id")
+target_fishnet <- left_join(target_fishnet, 
+                            computeAvgTemp(temp_summer_45) %>% rename(temp_summer_45 = temp), 
+                            by="id")
+target_fishnet <- left_join(target_fishnet, 
+                            computeAvgTemp(temp_autumn_45) %>% rename(temp_autumn_45 = temp), 
+                            by="id")
+target_fishnet <- left_join(target_fishnet, 
+                            computeAvgTemp(temp_winter_85) %>% rename(temp_winter_85 = temp), 
+                            by="id")
+target_fishnet <- left_join(target_fishnet, 
+                            computeAvgTemp(temp_spring_85) %>% rename(temp_spring_85 = temp), 
+                            by="id")
+target_fishnet <- left_join(target_fishnet, 
+                            computeAvgTemp(temp_summer_85) %>% rename(temp_summer_85 = temp), 
+                            by="id")
+target_fishnet <- left_join(target_fishnet, 
+                            computeAvgTemp(temp_autumn_85) %>% rename(temp_autumn_85 = temp), 
+                            by="id")
+```
+
+```{r}
+# Calculating saturation deficit for climate scenarios (assuming constant humidity)
+target_fishnet <- target_fishnet %>%
+  mutate(sd_winter_45 = (1 - (hum_winter_present/100)) * 4.9463 * exp(0.0621 * temp_winter_45)) %>%
+  mutate(sd_spring_45 = (1 - (hum_spring_present/100)) * 4.9463 * exp(0.0621 * temp_spring_45)) %>%
+  mutate(sd_summer_45 = (1 - (hum_summer_present/100)) * 4.9463 * exp(0.0621 * temp_summer_45)) %>%
+  mutate(sd_autumn_45 = (1 - (hum_autumn_present/100)) * 4.9463 * exp(0.0621 * temp_autumn_45)) %>%
+  mutate(sd_winter_85 = (1 - (hum_winter_present/100)) * 4.9463 * exp(0.0621 * temp_winter_85)) %>%
+  mutate(sd_spring_85 = (1 - (hum_spring_present/100)) * 4.9463 * exp(0.0621 * temp_spring_85)) %>%
+  mutate(sd_summer_85 = (1 - (hum_summer_present/100)) * 4.9463 * exp(0.0621 * temp_summer_85)) %>%
+  mutate(sd_autumn_85 = (1 - (hum_autumn_present/100)) * 4.9463 * exp(0.0621 * temp_autumn_85))
+```
+
+### Land cover
+```{r}
+# Loading Arealstatistik
+arealstatistik <- read.csv("raw_data/land_cover/ag-b-00.03-37-area-csv.csv", sep=";") %>%
+  select(E, N, AS18_17) %>%
+  rename(id_landcover = AS18_17) %>%
+  st_as_sf(coords = c("E", "N"), crs=2056, agr = "constant")
+
+arealstatistik_plateau <- arealstatistik[target_fishnet_union,,]
+
+rm(arealstatistik)
+```
+
+```{r}
+# Defining the weights for the 17 classes AS_17 defined in a separate csv
+land_cover_classes <- read.csv("raw_data/land_cover/land_cover_weights.csv")
+
+# Computing sum of weights per hexagon cell
+arealstatistik_plateau <- left_join(arealstatistik_plateau, land_cover_classes, by="id_landcover")
+arealstatistik_hexagon <- st_join(arealstatistik_plateau, target_fishnet, join = st_within)
+
+arealstatstik_per_hexagon <- setDT(arealstatistik_hexagon)[, .(land_cover = sum(weight)), by = id]
+
+target_fishnet <- left_join(target_fishnet, arealstatstik_per_hexagon, by="id") %>%
+  mutate(land_cover = ifelse(is.na(land_cover), 0, land_cover))
+```
+
+```{r}
+#mapview(target_fishnet, zcol="land_cover")
+```
+
+### Exposure
+```{r}
+# Calculating accessibility using the newer STATPOP dataset
+bfs_pop <- read.csv("raw_data/statpop/STATPOP2021.csv", sep=";") %>%
+  select(E_KOORD, N_KOORD, B21BTOT) %>%
+  rename(pop = B21BTOT) %>%
+  st_as_sf(coords = c("E_KOORD", "N_KOORD"), crs=2056, agr="constant")
+
+# radius that is considered "accessible"
+radius <- 15000
+
+# removing data points outside plateau, buffer with radius to ensure calculation is correct at the edges
+bfs_pop_plateau <- bfs_pop[target_fishnet_union %>% st_buffer(radius),,]
+
+# calculating sum of population within given radius of every raster cell
+hexagon_pop <- st_join(target_fishnet, bfs_pop_plateau, join = st_is_within_distance, dist = radius)
+
+acc_pop_per_hexagon <- setDT(hexagon_pop)[, .(pop_acc = sum(pop)), by = id]
+target_fishnet <- left_join(target_fishnet, acc_pop_per_hexagon, by="id")
+```
+
+```{r}
+mapview(target_fishnet, zcol="pop_acc")
+```
+
+```{r}
+# shortening column names
+target_fishnet_abb <- target_fishnet %>%
+  rename(h_w_2023 = hum_winter_present) %>%
+  rename(h_sp_2023 = hum_spring_present) %>%
+  rename(h_su_2023 = hum_summer_present) %>%
+  rename(h_a_2023 = hum_autumn_present) %>%
+  rename(t_w_2023 = temp_winter_present) %>%
+  rename(t_sp_2023 = temp_spring_present) %>%
+  rename(t_su_2023 = temp_summer_present) %>%
+  rename(t_a_2023 = temp_autumn_present) %>%
+  rename(sd_w_2023 = sd_winter_present) %>%
+  rename(sd_sp_2023 = sd_spring_present) %>%
+  rename(sd_su_2023 = sd_summer_present) %>%
+  rename(sd_a_2023 = sd_autumn_present) %>%
+  
+  rename(t_w_45 = temp_winter_45) %>%
+  rename(t_sp_45 = temp_spring_45) %>%
+  rename(t_su_45 = temp_summer_45) %>%
+  rename(t_a_45 = temp_autumn_45) %>%
+  rename(sd_w_45 = sd_winter_45) %>%
+  rename(sd_sp_45 = sd_spring_45) %>%
+  rename(sd_su_45 = sd_summer_45) %>%
+  rename(sd_a_45 = sd_autumn_45) %>%
+  
+  rename(t_w_85 = temp_winter_85) %>%
+  rename(t_sp_85 = temp_spring_85) %>%
+  rename(t_su_85 = temp_summer_85) %>%
+  rename(t_a_85 = temp_autumn_85) %>%
+  rename(sd_w_85 = sd_winter_85) %>%
+  rename(sd_sp_85 = sd_spring_85) %>%
+  rename(sd_su_85 = sd_summer_85) %>%
+  rename(sd_a_85 = sd_autumn_85) %>%
+  
+  rename(lnd_cvr = land_cover)
+
+# save fishnet with all intermediate variables as shp
+#st_write(na.omit(target_fishnet_abb), "processed_data/fishnet/fishnet.shp", append=F)
+```
+
+### Aggregation
+```{r}
+fishnet <- read_sf("processed_data/fishnet/fishnet.shp")
+
+# inserting column that is zero if temp < 7 and 1 if temp >= 7
+fishnet <- fishnet %>%
+  mutate(temp_above_7_winter_2023 = ifelse(t_w_2023 >= 7, 1, 0)) %>%
+  mutate(temp_above_7_spring_2023 = ifelse(t_sp_2023 >= 7, 1, 0)) %>%
+  mutate(temp_above_7_summer_2023 = ifelse(t_su_2023 >= 7, 1, 0)) %>%
+  mutate(temp_above_7_autumn_2023 = ifelse(t_a_2023 >= 7, 1, 0)) %>%
+  mutate(temp_above_7_winter_45 = ifelse(t_w_45 >= 7, 1, 0)) %>%
+  mutate(temp_above_7_spring_45 = ifelse(t_sp_45 >= 7, 1, 0)) %>%
+  mutate(temp_above_7_summer_45 = ifelse(t_su_45 >= 7, 1, 0)) %>%
+  mutate(temp_above_7_autumn_45 = ifelse(t_a_45 >= 7, 1, 0)) %>%
+  mutate(temp_above_7_winter_85 = ifelse(t_w_85 >= 7, 1, 0)) %>%
+  mutate(temp_above_7_spring_85 = ifelse(t_sp_85 >= 7, 1, 0)) %>%
+  mutate(temp_above_7_summer_85 = ifelse(t_su_85 >= 7, 1, 0)) %>%
+  mutate(temp_above_7_autumn_85 = ifelse(t_a_85 >= 7, 1, 0))
+
+# maximum saturation deficit value in a year
+max_sd <- max(max(fishnet$sd_sp_2023), 
+              max(fishnet$sd_su_2023), 
+              max(fishnet$sd_a_2023),
+              max(fishnet$sd_w_2023),
+              max(fishnet$sd_sp_45),
+              max(fishnet$sd_su_45),
+              max(fishnet$sd_a_45),
+              max(fishnet$sd_w_45),
+              max(fishnet$sd_sp_85),
+              max(fishnet$sd_su_85),
+              max(fishnet$sd_a_85),
+              max(fishnet$sd_w_85))
+
+# inverting saturation deficit values by subtracting from the max (--> highest saturation deficit values become zero)
+fishnet <- fishnet %>%
+  mutate(sd_spring_2023_inv = max_sd - sd_sp_2023) %>%
+  mutate(sd_summer_2023_inv = max_sd - sd_su_2023) %>%
+  mutate(sd_autumn_2023_inv = max_sd - sd_a_2023) %>%
+  mutate(sd_winter_2023_inv = max_sd - sd_w_2023) %>%
+  mutate(sd_spring_45_inv = max_sd - sd_sp_45) %>%
+  mutate(sd_summer_45_inv = max_sd - sd_su_45) %>%
+  mutate(sd_autumn_45_inv = max_sd - sd_a_45) %>%
+  mutate(sd_winter_45_inv = max_sd - sd_w_45) %>%
+  mutate(sd_spring_85_inv = max_sd - sd_sp_85) %>%
+  mutate(sd_summer_85_inv = max_sd - sd_su_85) %>%
+  mutate(sd_autumn_85_inv = max_sd - sd_a_85) %>%
+  mutate(sd_winter_85_inv = max_sd - sd_w_85)
+
+# maximum inverted saturation deficit value in a year
+max_inv_sd <- max(max(fishnet$sd_spring_2023_inv), 
+                  max(fishnet$sd_summer_2023_inv), 
+                  max(fishnet$sd_autumn_2023_inv),
+                  max(fishnet$sd_winter_2023_inv),
+                  max(fishnet$sd_spring_45_inv),
+                  max(fishnet$sd_summer_45_inv),
+                  max(fishnet$sd_autumn_45_inv),
+                  max(fishnet$sd_winter_45_inv),
+                  max(fishnet$sd_spring_85_inv),
+                  max(fishnet$sd_summer_85_inv),
+                  max(fishnet$sd_autumn_85_inv),
+                  max(fishnet$sd_winter_85_inv))
+
+# minimum inverted saturation deficit value in a year
+min_inv_sd <- min(min(fishnet$sd_spring_2023_inv), 
+                  min(fishnet$sd_summer_2023_inv), 
+                  min(fishnet$sd_autumn_2023_inv),
+                  min(fishnet$sd_winter_2023_inv),
+                  min(fishnet$sd_spring_45_inv),
+                  min(fishnet$sd_summer_45_inv),
+                  min(fishnet$sd_autumn_45_inv),
+                  min(fishnet$sd_winter_45_inv),
+                  min(fishnet$sd_spring_85_inv),
+                  min(fishnet$sd_summer_85_inv),
+                  min(fishnet$sd_autumn_85_inv),
+                  min(fishnet$sd_winter_85_inv))
+
+# normalizing the values between zero and one
+fishnet <- fishnet %>%
+  mutate(sd_spring_2023_norm = (sd_spring_2023_inv - min_inv_sd) /(max_inv_sd - min_inv_sd)) %>%
+  mutate(sd_summer_2023_norm = (sd_summer_2023_inv - min_inv_sd) /(max_inv_sd - min_inv_sd)) %>%
+  mutate(sd_autumn_2023_norm = (sd_autumn_2023_inv - min_inv_sd) /(max_inv_sd - min_inv_sd)) %>%
+  mutate(sd_winter_2023_norm = (sd_winter_2023_inv - min_inv_sd) /(max_inv_sd - min_inv_sd)) %>%
+  
+  mutate(sd_spring_45_norm = (sd_spring_45_inv - min_inv_sd) /(max_inv_sd - min_inv_sd)) %>%
+  mutate(sd_summer_45_norm = (sd_summer_45_inv - min_inv_sd) /(max_inv_sd - min_inv_sd)) %>%
+  mutate(sd_autumn_45_norm = (sd_autumn_45_inv - min_inv_sd) /(max_inv_sd - min_inv_sd)) %>%
+  mutate(sd_winter_45_norm = (sd_winter_45_inv - min_inv_sd) /(max_inv_sd - min_inv_sd)) %>%
+  
+  mutate(sd_spring_85_norm = (sd_spring_85_inv - min_inv_sd) /(max_inv_sd - min_inv_sd)) %>%
+  mutate(sd_summer_85_norm = (sd_summer_85_inv - min_inv_sd) /(max_inv_sd - min_inv_sd)) %>%
+  mutate(sd_autumn_85_norm = (sd_autumn_85_inv - min_inv_sd) /(max_inv_sd - min_inv_sd)) %>%
+  mutate(sd_winter_85_norm = (sd_winter_85_inv - min_inv_sd) /(max_inv_sd - min_inv_sd)) %>%
+  
+  mutate(land_cover_norm = (lnd_cvr - min(lnd_cvr)) / (max(lnd_cvr) - min(lnd_cvr))) %>%
+  mutate(pop_acc_norm = (pop_acc - min(pop_acc)) / (max(pop_acc) - min(pop_acc)))
+
+# Multiplication of the normalized values to obtain final tick bite risk
+tick_risk <- fishnet %>%
+  mutate(tick_risk_spring_2023 = temp_above_7_spring_2023 * sd_spring_2023_norm * land_cover_norm * pop_acc_norm) %>%
+  mutate(tick_risk_summer_2023 = temp_above_7_summer_2023 * sd_summer_2023_norm * land_cover_norm * pop_acc_norm) %>%
+  mutate(tick_risk_autumn_2023 = temp_above_7_autumn_2023 * sd_autumn_2023_norm * land_cover_norm * pop_acc_norm) %>%
+  mutate(tick_risk_winter_2023 = temp_above_7_winter_2023 * sd_winter_2023_norm * land_cover_norm * pop_acc_norm) %>%
+  
+  mutate(tick_risk_spring_45 = temp_above_7_spring_45 * sd_spring_45_norm * land_cover_norm * pop_acc_norm) %>%
+  mutate(tick_risk_summer_45 = temp_above_7_summer_45 * sd_summer_45_norm * land_cover_norm * pop_acc_norm) %>%
+  mutate(tick_risk_autumn_45 = temp_above_7_autumn_45 * sd_autumn_45_norm * land_cover_norm * pop_acc_norm) %>%
+  mutate(tick_risk_winter_45 = temp_above_7_winter_45 * sd_winter_45_norm * land_cover_norm * pop_acc_norm) %>%
+  
+  mutate(tick_risk_spring_85 = temp_above_7_spring_85 * sd_spring_85_norm * land_cover_norm * pop_acc_norm) %>%
+  mutate(tick_risk_summer_85 = temp_above_7_summer_85 * sd_summer_85_norm * land_cover_norm * pop_acc_norm) %>%
+  mutate(tick_risk_autumn_85 = temp_above_7_autumn_85 * sd_autumn_85_norm * land_cover_norm * pop_acc_norm) %>%
+  mutate(tick_risk_winter_85 = temp_above_7_winter_85 * sd_winter_85_norm * land_cover_norm * pop_acc_norm) %>%
+  
+  select(tick_risk_spring_2023, tick_risk_summer_2023, tick_risk_autumn_2023, tick_risk_winter_2023,
+         tick_risk_spring_45, tick_risk_summer_45, tick_risk_autumn_45, tick_risk_winter_45,
+         tick_risk_spring_85, tick_risk_summer_85, tick_risk_autumn_85, tick_risk_winter_85) %>%
+  
+  rename(risk_sp_23 = tick_risk_spring_2023) %>%
+  rename(risk_su_23 = tick_risk_summer_2023) %>%
+  rename(risk_a_23 = tick_risk_autumn_2023) %>%
+  rename(risk_w_23 = tick_risk_winter_2023) %>%
+  rename(risk_sp_45 = tick_risk_spring_45) %>%
+  rename(risk_su_45 = tick_risk_summer_45) %>%
+  rename(risk_a_45 = tick_risk_autumn_45) %>%
+  rename(risk_w_45 = tick_risk_winter_45) %>%
+  rename(risk_sp_85 = tick_risk_spring_85) %>%
+  rename(risk_su_85 = tick_risk_summer_85) %>%
+  rename(risk_a_85 = tick_risk_autumn_85) %>%
+  rename(risk_w_85 = tick_risk_winter_85)
+```
+
+```{r}
+mapview(tick_risk, zcol="risk_w_85")
+```
+
+```{r}
+# save final tick bite risk as shp
+st_write(tick_risk, "processed_data/tick_bite_risk/tick_bite_risk.shp", append=F)
+```
+
+```{r}
+# Loading the final data
+tick_bite_risk <- st_transform(read_sf("processed_data/tick_bite_risk/tick_bite_risk.shp"), crs=4326)
+
+mapview(tick_bite_risk, zcol="risk_su_85")
+```
+
+# Reported tick bites
+
+```{r}
+tickbites <- read.csv("raw_data/tick_bites/20230611-tick-reports.csv", sep=";") %>% 
+  st_as_sf(coords=c("Lon", "Lat"), crs=4326) %>% 
+  st_transform(2056) %>%
+  select(geometry, date, ID) %>%
+  mutate(month=month(ymd_hms(date))) %>%
+  mutate(year=year(ymd_hms(date))) %>%
+  mutate(season = ifelse(month %in% c(12, 1, 2), "Winter",
+                      ifelse(month %in% c(3, 4, 5), "Spring",
+                             ifelse(month %in% c(6, 7, 8), "Summer", "Autumn"))))
+
+# removing tick bites outside mittelland
+tickbites_plateau <- tickbites[target_fishnet_union,,]
+
+st_write(tickbites_plateau, "processed_data/tick_bites/tick_bites_plateau.shp", append=F)
+```
+
